@@ -16,26 +16,26 @@ The questions marked ★ change a core rule. Ask these first.
 |---|---|---|---|
 | 1 | Peak / quiet edit rate? | Peak is 20 edits/s across both sides, of which 10/s go out to Salesforce. A quiet hour is about 1/s. | At 200/s or more, outbound traffic exceeds the cap. We would need composite batching, and 30 s would depend on queue depth. |
 | 2 | Is the 100 rps cap ours alone? | Yes. We run at **80 rps**. That budget covers updates, retries and catch-up queries, and leaves 20 rps headroom. | A shared cap shrinks our budget, drain time grows in proportion, and we need a central limiter. |
-| 3 | Does a composite call count as 1 request? | **Not assumed.** All math uses one record per call. Composite is an optional speed-up only. | If confirmed, the drain falls from about 51 min to under 1 min (§10). |
+| 3 | Does a composite call count as 1 request? | **Not assumed.** All math uses one record per call. Composite is an optional speed-up only. | If confirmed, the drain falls from about 51 min to under 1 min (section 10). |
 | 4 | Webhook carries changed fields only, or the full record? | Changed fields only (as in the sample). | Full record: we diff each field against `sf_value`. Only fields that differ count as changed. |
 | 5 | Is the `eventId` the same on redelivery? | Yes. We dedupe on it. | We dedupe on `(recordId, occurredAt, hash(changedFields))` instead. |
-| 6 ★ | Does the webhook carry a record version (`SystemModstamp`)? | No. We order by `occurredAt` and break ties as in §7. We **ask to add `sfModstamp`** so webhooks and catch-up rows share one order source. | If it exists, we order Salesforce events by it. That is immune to clock skew. |
-| 7 | Does Salesforce retry when we return a non-2xx? | Yes, for a limited window. We return 2xx only after commit. | With fire-and-forget delivery, the periodic catch-up poll (§10) becomes our only safety net for lost webhooks. |
+| 6 ★ | Does the webhook carry a record version (`SystemModstamp`)? | No. We order by `occurredAt` and break ties as in section 7. We **ask to add `sfModstamp`** so webhooks and catch-up rows share one order source. | If it exists, we order Salesforce events by it. That is immune to clock skew. |
+| 7 | Does Salesforce retry when we return a non-2xx? | Yes, for a limited window. We return 2xx only after commit. | With fire-and-forget delivery, the periodic catch-up poll (section 10) becomes our only safety net for lost webhooks. |
 | 8 | How is the webhook authenticated? | HMAC-SHA256 over the body, plus a timestamp header. Reject if the timestamp is more than 5 min old. | Without signing, we need mTLS or a Salesforce IP allowlist. |
 | 9 | Time and actor on a portal edit? | Time is the Postgres commit time (`now()` in the transaction). Actor comes from the authenticated session, never from the payload. | If we trusted the client clock, we would need skew bounds, and spoofing would be possible. |
 | 10 | Can Salesforce time and our time be compared? | Yes. Both use NTP, with skew under 1 s. | If not, cross-side ordering uses arrival order at our database. Edits within the skew window are flagged for review. |
 | 11 | Unit of merge? | **Field**, not record. | Record-level merging would lose concurrent edits to different fields. That breaks the brief. |
 | 12 | Two portal users edit the same field? | The later commit wins. The loser's value goes to history and the loser gets a notice. Only the winning value goes to Salesforce. | If saves must be blocked instead, we need optimistic locking on the form and a 409 flow. |
-| 13 ★ | Does our own API write trigger a webhook? Do Salesforce triggers or flows edit other fields in the same save? | Yes to both. Echo detection is **per field** (§9). We never drop a webhook just because it came from the integration user. | If Salesforce has no automation, the per-field check stays anyway because it is cheap. |
+| 13 ★ | Does our own API write trigger a webhook? Do Salesforce triggers or flows edit other fields in the same save? | Yes to both. Echo detection is **per field** (section 9). We never drop a webhook just because it came from the integration user. | If Salesforce has no automation, the per-field check stays anyway because it is cheap. |
 | 14 ★ | Can we query Salesforce for records changed since time T? | Yes, with SOQL on `SystemModstamp > T`, paged at 2,000 rows. **Those calls count against the cap.** (Assumed: this API is not in the brief.) This query returns only the **latest** full record, so it is used for verification only. History comes from #27. | If not, we need a full 5 M-record sweep (2,500 calls plus a diff of every row) or Change Data Capture replay (72 h retention). |
 | 27 ★ | Can we read every intermediate Salesforce change, with the field and the user who made it? | Yes. The client enables **Field History Tracking** on our 9 fields (Account: name, status, owner. Contact: name, phone, email, mailing city, owner, AccountId). We query `ContactHistory` and `AccountHistory` (`ParentId, Field, OldValue, NewValue, CreatedById, CreatedDate`). Assumed: the API is not in the brief, and tracking must be switched on **before** go-live because it is not retroactive. | **Change Data Capture replay** (72 h retention, gives each event with its changed fields and user) does the same job. If neither is allowed, intermediate edits during an outage are truly lost. We would record a `gap` history row so the loss is visible, not silent, and tell the client this breaks "dropping history counts as losing a change". |
 | 15 | During the outage, are webhooks down too? | Yes. They may never arrive. | If webhooks still flow, inbound needs no catch-up and only outbound drains. |
-| 16 | Where do pending calls live? | pg-boss queue in our Postgres. The job is enqueued in the same transaction as the edit (§6). | With a separate broker, we need a transactional bridge, or we risk lost or doubled sends. |
+| 16 | Where do pending calls live? | pg-boss queue in our Postgres. The job is enqueued in the same transaction as the edit (section 6). | With a separate broker, we need a transactional bridge, or we risk lost or doubled sends. |
 | 17 ★ | Can we add an external-ID field `Portal_Id__c` in Salesforce? | Yes. Creates are upserts on it, so a retry never creates a duplicate. | Creates are not idempotent. We must look up by email before retrying, and duplicates are still possible. |
 | 18 | Same person created on both sides? | No automatic merge. We flag likely duplicates by email. | Automatic merging needs matching rules plus a merge flow, which brings deletes into scope. |
 | 19 | A contact arrives before its customer? | Store the contact with an unresolved `sf_customer_id`. Resolve it when the customer arrives. | Strict foreign keys mean parking the event and retrying it, which risks the 30 s target. |
 | 20 | Salesforce owner Id → portal user? | Static mapping table. Store the raw Salesforce Id when there is no mapping. | If the owner must be a real portal user, the record blocks until an admin fixes the mapping. |
-| 21 | Salesforce rejects an update (permanent 4xx)? | Revert to the last value Salesforce accepted, **only if no newer change exists** (version compare-and-set). History keeps the rejected value. The editor is notified. Details in §6. | If the client says to keep the portal value, the field is flagged `diverged` and goes on a nightly ops report for manual fixing. |
+| 21 | Salesforce rejects an update (permanent 4xx)? | Revert to the last value Salesforce accepted, **only if no newer change exists** (version compare-and-set). History keeps the rejected value. The editor is notified. Details in section 6. | If the client says to keep the portal value, the field is flagged `diverged` and goes on a nightly ops report for manual fixing. |
 | 22 | How long is history kept? | Forever. The table is partitioned by month. | With bounded retention, "lost change" only holds within the window. |
 | 23 | Initial 5 M backfill? | Out of scope. Assumed done through the Bulk API. | Otherwise it is a separate subproblem: 2,500 query pages plus an insert job. |
 | 24 | Formatting differences (phone, email case)? | Normalise before any compare: phone to E.164, email to lowercase. | Without normalising, spurious conflicts appear and echoes go unmatched. |
@@ -73,7 +73,7 @@ The questions marked ★ change a core rule. Ask these first.
 - **The webhook handler** must answer fast and must never wait on Salesforce. It scales with inbound traffic.
 - **The sync worker** owns every outbound call and the rate limiter. It can crash and restart without losing work.
 - **What crosses between them is Postgres rows only:** `field_state`, `sync_state`, and pg-boss jobs (`sf-sync`, data `{ portalId }`). They make no direct calls to each other. pg-boss lives in the same Postgres, so there is no second store to keep consistent.
-- We run **one worker** for now, so the token bucket lives in that process. Several workers would need a shared limiter (out of scope, §12).
+- We run **one worker** for now, so the token bucket lives in that process. Several workers would need a shared limiter (out of scope, section 12).
 
 **Interfaces**
 
@@ -89,15 +89,15 @@ The questions marked ★ change a core rule. Ask these first.
 
 | # | Subproblem | Why this position |
 |---|---|---|
-| 1 | **Field-level state and the ordering rule** (`field_state`, `field_history`, the compare in §7) | Every other path calls it. It is schema, so it is the most expensive thing to change later. If it is wrong, data is lost silently. |
+| 1 | **Field-level state and the ordering rule** (`field_state`, `field_history`, the compare in section 7) | Every other path calls it. It is schema, so it is the most expensive thing to change later. If it is wrong, data is lost silently. |
 | 2 | **Spike: confirm the catch-up query** (question #14) the external-ID upsert (question #17), and the pg-boss features (#26) | These are external assumptions. If either is false, the outage and create designs change. Find out on day 1, not day 5. |
 | 3 | **pg-boss queue, rate-limited worker, restart recovery, dead letter** | Needed for the 6-hour outage and the 100 rps cap. pg-boss supplies leases, retries and dead letter. We still own the token bucket, the circuit breaker, and the read of `value ≠ sf_value`. |
 | 4 | **Inbound webhook:** verify, dedupe, apply | Straightforward once #1 exists. |
-| 5 | **Echo matching** (loop rule, §9) | Needs both #3 (the send log) and #4 (the inbound path). |
-| 6 | **Rejection handling** (4xx compare-and-set revert, §6) | Needs `field_state.version` and `sf_send_log`. |
+| 5 | **Echo matching** (loop rule, section 9) | Needs both #3 (the send log) and #4 (the inbound path). |
+| 6 | **Rejection handling** (4xx compare-and-set revert, section 6) | Needs `field_state.version` and `sf_send_log`. |
 | 7 | **Outage detection, catch-up, drain** | Builds on #2, #3 and #4. |
 | 8 | **Creates and identity** (Salesforce Id ↔ portal Id, contacts before their customer) | Mostly mapping work, low risk. |
-| 9 | **Metrics and alerts** (§11) | Last, but before going live. |
+| 9 | **Metrics and alerts** (section 11) | Last, but before going live. |
 
 ---
 
@@ -112,7 +112,7 @@ CREATE TYPE send_status     AS ENUM ('in_flight', 'done', 'rejected', 'failed');
 CREATE TYPE sf_status       AS ENUM ('up', 'down');
 
 -- Identity. Portal-created records have no sf_id until Salesforce confirms the create.
--- Every transaction that writes a record's state locks this row first (§7).
+-- Every transaction that writes a record's state locks this row first (section 7).
 record (
   portal_id        uuid PK,
   sf_id            text UNIQUE NULL,
@@ -125,14 +125,14 @@ field_state (
   portal_id        uuid,
   field            text,
   value            text,           -- current value, normalised (#24)
-  version          bigint,         -- +1 on every change to `value`; used for compare-and-set (§6)
-  order_ts         timestamptz,    -- time of the edit that set `value`; used by the ordering rule (§7)
-  order_tiebreak   text,           -- see §7
+  version          bigint,         -- +1 on every change to `value`; used for compare-and-set (section 6)
+  order_ts         timestamptz,    -- time of the edit that set `value`; used by the ordering rule (section 7)
+  order_tiebreak   text,           -- see section 7
   actor            text,
   source           change_source,
   sf_value         text,           -- the value Salesforce holds, as far as we know
   sf_value_ts      timestamptz,    -- time of the Salesforce event (or our 2xx) that set sf_value
-  diverged         boolean DEFAULT false,   -- set when the push guard trips (§9)
+  diverged         boolean DEFAULT false,   -- set when the push guard trips (section 9)
   PRIMARY KEY (portal_id, field)
 )
 -- A field needs sending when value IS DISTINCT FROM sf_value.
@@ -154,7 +154,7 @@ inbox_event (
 )
 
 -- Every value we sent to Salesforce.
--- Used for echo matching (§9), the rejection compare-and-set (§6) and the push guard (§9).
+-- Used for echo matching (section 9), the rejection compare-and-set (section 6) and the push guard (section 9).
 sf_send_log (
   id             bigserial PK,
   portal_id      uuid,
@@ -191,7 +191,7 @@ The whole path runs in **one transaction**, and we return 200 only after commit.
 
 1. **Verify** the HMAC and the timestamp (no more than 5 min old). On failure, return `401`.
 2. **Validate** the body: `objectType`, fields within scope, a parseable `occurredAt`. On failure, return `400` and log it.
-3. **Dedupe:** `INSERT INTO inbox_event … ON CONFLICT (event_id) DO NOTHING`. If no row was inserted, it is a duplicate, so return `200` and stop (§8).
+3. **Dedupe:** `INSERT INTO inbox_event … ON CONFLICT (event_id) DO NOTHING`. If no row was inserted, it is a duplicate, so return `200` and stop (section 8).
 4. **Resolve identity and lock:**
    - Find `record` by `sf_id`.
    - If there is none, find it by `Portal_Id__c` from the payload (#25) and store the `sf_id`. This covers the webhook for our own create arriving before we have processed our 2xx.
@@ -200,9 +200,9 @@ The whole path runs in **one transaction**, and we return 200 only after commit.
 5. **For each field** in `changedFields`:
    1. Normalise the value (#24).
    2. **Update the Salesforce value:** if `occurredAt > sf_value_ts`, set `sf_value` and `sf_value_ts`. Do this for every event, echoes included.
-   3. If `changedBy` is the integration user, run the **echo check** (§9). If it matches, write history `echo`, set the send log row to `done`, and skip to the next field.
-   4. Apply the **ordering rule** (§7) to `value`. If the incoming change is newer, update `value`, `version + 1`, `order_ts = occurredAt`, `source` and `actor`, then write history `applied`. If it is older, write history `superseded` and leave `value` alone.
-6. **Enqueue only if needed:** if any field of the record now has `value ≠ sf_value`, call `boss.send('sf-sync', { portalId }, { singletonKey: portalId, db: tx })`. Normally the applied change makes the two equal and nothing is enqueued. This step only fires in the race in §7, case C.
+   3. If `changedBy` is the integration user, run the **echo check** (section 9). If it matches, write history `echo`, set the send log row to `done`, and skip to the next field.
+   4. Apply the **ordering rule** (section 7) to `value`. If the incoming change is newer, update `value`, `version + 1`, `order_ts = occurredAt`, `source` and `actor`, then write history `applied`. If it is older, write history `superseded` and leave `value` alone.
+6. **Enqueue only if needed:** if any field of the record now has `value ≠ sf_value`, call `boss.send('sf-sync', { portalId }, { singletonKey: portalId, db: tx })`. Normally the applied change makes the two equal and nothing is enqueued. This step only fires in the race in section 7, case C.
 7. Commit, then return `200`. On any exception, roll back and return `500`, so Salesforce retries. The retry is safe because the dedupe insert was rolled back too.
 
 Latency: one round trip to the database. That is well inside 30 s.
@@ -256,13 +256,13 @@ Retry budget for `sf-sync`: 2 + 4 + … + 1,024 = 2,046 s, about 34 min, before 
 
 | Result | Action |
 |---|---|
-| `2xx` | In a transaction, lock the record. For each sent field, mark the send log `done`, and set `sf_value` to the sent value and `sf_value_ts = now()` if that is newer than the current `sf_value_ts`. On a create, store `sf_id`. If any field still has `value ≠ sf_value` (it was edited during the call, or see §7 case C), send a new job. Complete. |
+| `2xx` | In a transaction, lock the record. For each sent field, mark the send log `done`, and set `sf_value` to the sent value and `sf_value_ts = now()` if that is newer than the current `sf_value_ts`. On a create, store `sf_id`. If any field still has `value ≠ sf_value` (it was edited during the call, or see section 7 case C), send a new job. Complete. |
 | `429` | Pause the bucket until `Retry-After`. Mark the send log `failed`. Send a new job with `startAfter` set to the `Retry-After` time and the same `singletonKey`. Complete. **This does not use up a retry.** |
 | `5xx`, timeout, connection error | Mark the send log `failed` and feed the breaker. Throw, so pg-boss retries with backoff. |
 | Permanent `4xx` | Apply the rejection rule below, then complete. A rejection is a handled outcome, not a job failure. |
-| Handler bug or process crash | The handler throws or the process dies. pg-boss retries, and on a crash the job expires after 60 s first. After 10 failures the job moves to `sf-sync-dead`, and that pages someone (§11). |
+| Handler bug or process crash | The handler throws or the process dies. pg-boss retries, and on a crash the job expires after 60 s first. After 10 failures the job moves to `sf-sync-dead`, and that pages someone (section 11). |
 
-**Circuit breaker:** while it is open (§10), call `offWork('sf-sync')`. Queued jobs stay in `created` or `retry`, no attempts are used, and nothing dead-letters during an outage.
+**Circuit breaker:** while it is open (section 10), call `offWork('sf-sync')`. Queued jobs stay in `created` or `retry`, no attempts are used, and nothing dead-letters during an outage.
 
 **Restart:** pg-boss expires active jobs after 60 s and retries them. A resend is safe because an update just sets the same values again and a create is an upsert on `Portal_Id__c`.
 
@@ -304,7 +304,7 @@ The incoming change applies only if its key is greater than the stored `(order_t
 
 Why Salesforce wins a tie: it is the client's system of record for sales, and any deterministic rule is enough to give one current value.
 
-**Two portal users:** both saves lock the same row. The later commit has the later `now()` and wins. The earlier user gets a `user_notice` (#12). Only the winning value goes out, because the job reads the current value when it runs (§6).
+**Two portal users:** both saves lock the same row. The later commit has the later `now()` and wins. The earlier user gets a `user_notice` (#12). Only the winning value goes out, because the job reads the current value when it runs (section 6).
 
 **Full-record webhook (if #4 flips):** only fields whose normalised value differs from `sf_value` go through this rule. The rest are ignored.
 
@@ -320,7 +320,7 @@ Why Salesforce wins a tie: it is the client's system of record for sales, and an
 **Case B: same field, and both edits reach our database before we call Salesforce.**
 1. The portal sets city to Noida at 10:00:02.
 2. A webhook sets city to Pune with `occurredAt` 10:00:03.
-3. The lock serialises the two transactions. In either commit order, §7 picks Pune, because 03 > 02.
+3. The lock serialises the two transactions. In either commit order, section 7 picks Pune, because 03 > 02.
 4. Now `value = sf_value = Pune`, so the job finds nothing to send. Both sides hold Pune.
 
 **Case C: race across the HTTP call, where the lock can't help.**
@@ -343,7 +343,7 @@ If the webhook from step 2 arrives *after* our 2xx, we end in the same place. Th
 
 **Duplicate:** `inbox_event.event_id` is the primary key. A second delivery hits `ON CONFLICT DO NOTHING` and gets `200`, and nothing else happens. Because the insert sits in the same transaction as the apply, a crash midway leaves neither, and Salesforce's retry processes it cleanly. Catch-up rows use the synthetic id `cu:{sfId}:{SystemModstamp}`, so a webhook and a catch-up row for the same save are both processed. That is safe, because the second one loses the ordering rule (its key is equal, not greater) and is recorded only as history.
 
-**Older webhook after a newer one:** the per-field compare in §7 rejects it, because `occurredAt` is not greater than the stored `order_ts`. It is still written to `field_history` as `superseded`, with its real `occurredAt`, so history sorted by `order_ts` shows the true order of edits. It never overwrites the newer value.
+**Older webhook after a newer one:** the per-field compare in section 7 rejects it, because `occurredAt` is not greater than the stored `order_ts`. It is still written to `field_history` as `superseded`, with its real `occurredAt`, so history sorted by `order_ts` shows the true order of edits. It never overwrites the newer value.
 
 Example: the phone is edited at 11:30:04 (event A) and at 11:30:09 (event B). B arrives first and is applied. A arrives afterwards, 04 < 09, so A is written to history as `superseded` and the phone stays at B.
 
@@ -354,7 +354,7 @@ Example: the phone is edited at 11:30:04 (event A) and at 11:30:09 (event B). B 
 **Rule 1 (the guarantee): send only differences.** The worker sends a field only when `value ≠ sf_value`. Every event from Salesforce updates `sf_value`: a normal webhook, an echo, or a catch-up row. Therefore:
 - When we apply a Salesforce change, `value = sf_value` afterwards, so nothing is sent back.
 - Our own echo makes `sf_value` equal to what we sent, so nothing more is sent.
-- Only a real difference produces a call: a portal edit, or the race in §7 case C. That call removes the difference.
+- Only a real difference produces a call: a portal edit, or the race in section 7 case C. That call removes the difference.
 
 *This replaces the earlier rule "inbound changes never enqueue".* That rule could not repair case C, where Salesforce ends up holding our older value.
 
@@ -366,16 +366,16 @@ match = an sf_send_log row with status 'done' or 'in_flight',
         sent_at within the last 10 min
 ```
 
-- **Match:** it is an echo. Write history `echo` and leave `value` alone. The portal actor stays the author of record. (`sf_value` was already updated in §5, step 5.2.)
-- **No match:** it is a real change made by automation. Apply it through §7 with `source = 'sf_automation'` and actor `salesforce-automation (via integration user)`.
+- **Match:** it is an echo. Write history `echo` and leave `value` alone. The portal actor stays the author of record. (`sf_value` was already updated in section 5, step 5.2.)
+- **No match:** it is a real change made by automation. Apply it through section 7 with `source = 'sf_automation'` and actor `salesforce-automation (via integration user)`.
 - **Salesforce reformatted our value** (for example the phone format): there is no match, so the value is applied as an automation change. Its `occurredAt` is newer, so `value = sf_value` afterwards and nothing is sent. The loop ends after one step.
 
-Webhooks from any other user skip the echo check and go straight to §7.
+Webhooks from any other user skip the echo check and go straight to section 7.
 
 **Rule 3 (safety guard).** If `sf_send_log` has more than 3 sends for the same `(portal_id, field)` within 10 min:
 - set `diverged = true`,
 - stop sending that field (the handler skips it),
-- raise an alert (§11).
+- raise an alert (section 11).
 
 This catches bugs, such as a mismatch between our normaliser and Salesforce's, before they burn the rate limit forever.
 
@@ -393,11 +393,11 @@ This catches bugs, such as a mismatch between our normaliser and Salesforce's, b
 
 **Drain on recovery, in this order:**
 1. **Catch-up first, in three steps** (#27). The window starts at `outage_start − 5 min`, an overlap margin.
-   1. **Field history.** Query `ContactHistory` and `AccountHistory` with `CreatedDate > window`, `ORDER BY CreatedDate, Id`, paged at 2,000 rows. **Each history row is one field change, with its user and time.** Turn each row into a single-field event and run it through the inbound path (§5):
+   1. **Field history.** Query `ContactHistory` and `AccountHistory` with `CreatedDate > window`, `ORDER BY CreatedDate, Id`, paged at 2,000 rows. **Each history row is one field change, with its user and time.** Turn each row into a single-field event and run it through the inbound path (section 5):
       - `event_id = 'h:' || history Id`. This is stable, so a re-run of catch-up dedupes on it.
       - `changedFields = { field: NewValue }`. The Salesforce field name is mapped to ours (for example `MailingCity` → `city`).
       - `occurredAt = CreatedDate`, `changedBy` = the `CreatedById` user.
-      - The echo check (§9) applies as normal, so our own writes found in history are recorded as `echo`.
+      - The echo check (section 9) applies as normal, so our own writes found in history are recorded as `echo`.
 
       Three changes to phone become three history rows in order. Two end as `superseded` and the last as `applied`. Nothing is lost.
    2. **Users.** Collect the distinct `CreatedById` values and resolve them to emails with one `SELECT Id, Email FROM User WHERE Id IN (…)` query. Expect a few hundred users at most, so 1 call.
@@ -407,7 +407,7 @@ This catches bugs, such as a mismatch between our normaliser and Salesforce's, b
    - **Duplicates across sources.** A change can arrive both as a webhook and as a history row, with different ids. History `CreatedDate` has only second precision. Before writing a history-row event, skip it if `field_history` already holds the same `(portal_id, field, value, actor)` with `order_ts` in the same second.
    - **Order within one second.** Use history `Id` order. Assumed close enough, because ties within one second on one field are rare.
 
-   All of this puts Salesforce's values in place **before** we push portal edits, so §7 decides each conflict correctly.
+   All of this puts Salesforce's values in place **before** we push portal edits, so section 7 decides each conflict correctly.
 2. **Resume `sf-sync` work.** Each job sends only fields where `value ≠ sf_value`. A portal edit that lost to a newer Salesforce value in step 1 is therefore never sent. Everything else is sent at the bucket rate.
 3. Every call in steps 1 and 2 uses the same 80 rps bucket, and catch-up has priority.
 
@@ -455,7 +455,7 @@ Failure alerts, which catch jobs that fail for good and handlers that crash:
 |---|---|---|
 | **Dead-letter jobs** (size of `sf-sync-dead` and `sf-catchup-dead`) | A job failed all its retries, or the handler kept crashing on it. Its record stays out of sync until someone acts. | **Any job (> 0).** Runbook: read the job's last error, fix the cause, then re-send `{ portalId }` to `sf-sync`. |
 | **Webhook 5xx rate** | The inbound handler is failing. Salesforce retries, but it gives up eventually. | Over **1% for 5 min**. |
-| **Diverged fields** (`field_state.diverged = true`) | The loop guard tripped (§9). The field is no longer being synced. | **Any (> 0).** |
+| **Diverged fields** (`field_state.diverged = true`) | The loop guard tripped (section 9). The field is no longer being synced. | **Any (> 0).** |
 
 ---
 
@@ -531,7 +531,7 @@ Failure alerts, which catch jobs that fail for good and handlers that crash:
 |---|---|---|
 | C1 | In parallel: portal edits city, webhook edits phone. | Both survive. Exactly one call, carrying city. |
 | C2 | In parallel: portal sets city (02), webhook sets city (03). | Value is the webhook's. No call. |
-| C3 | Case C from §7: hold our Noida call, post the Pune webhook (03), then release. | Fake Salesforce receives 2 calls (Noida, then Pune). Both sides end on Pune. |
+| C3 | Case C from section 7: hold our Noida call, post the Pune webhook (03), then release. | Fake Salesforce receives 2 calls (Noida, then Pune). Both sides end on Pune. |
 | C4 | Two portal users save the same field in parallel. | The later commit wins. The loser gets a notice. Salesforce ends on the winning value. |
 | C5 | 50 rapid edits to one record. | Fake Salesforce never sees more than 1 concurrent call for that record. The final values match. |
 

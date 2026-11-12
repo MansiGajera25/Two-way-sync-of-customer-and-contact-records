@@ -27,7 +27,8 @@ The questions marked ★ change a core rule. Ask these first.
 | 11 | Unit of merge? | **Field**, not record. | Record-level merging would lose concurrent edits to different fields. That breaks the brief. |
 | 12 | Two portal users edit the same field? | The later commit wins. The loser's value goes to history and the loser gets a notice. Only the winning value goes to Salesforce. | If saves must be blocked instead, we need optimistic locking on the form and a 409 flow. |
 | 13 ★ | Does our own API write trigger a webhook? Do Salesforce triggers or flows edit other fields in the same save? | Yes to both. Echo detection is **per field** (§9). We never drop a webhook just because it came from the integration user. | If Salesforce has no automation, the per-field check stays anyway because it is cheap. |
-| 14 ★ | Can we query Salesforce for records changed since time T? | Yes, with SOQL on `SystemModstamp > T`, paged at 2,000 rows. **Those calls count against the cap.** (Assumed: this API is not in the brief.) | If not, we need a full 5 M-record sweep (2,500 calls plus a diff of every row) or Change Data Capture replay (72 h retention). |
+| 14 ★ | Can we query Salesforce for records changed since time T? | Yes, with SOQL on `SystemModstamp > T`, paged at 2,000 rows. **Those calls count against the cap.** (Assumed: this API is not in the brief.) This query returns only the **latest** full record, so it is used for verification only. History comes from #27. | If not, we need a full 5 M-record sweep (2,500 calls plus a diff of every row) or Change Data Capture replay (72 h retention). |
+| 27 ★ | Can we read every intermediate Salesforce change, with the field and the user who made it? | Yes. The client enables **Field History Tracking** on our 9 fields (Account: name, status, owner. Contact: name, phone, email, mailing city, owner, AccountId). We query `ContactHistory` and `AccountHistory` (`ParentId, Field, OldValue, NewValue, CreatedById, CreatedDate`). Assumed: the API is not in the brief, and tracking must be switched on **before** go-live because it is not retroactive. | **Change Data Capture replay** (72 h retention, gives each event with its changed fields and user) does the same job. If neither is allowed, intermediate edits during an outage are truly lost. We would record a `gap` history row so the loss is visible, not silent, and tell the client this breaks "dropping history counts as losing a change". |
 | 15 | During the outage, are webhooks down too? | Yes. They may never arrive. | If webhooks still flow, inbound needs no catch-up and only outbound drains. |
 | 16 | Where do pending calls live? | pg-boss queue in our Postgres. The job is enqueued in the same transaction as the edit (§6). | With a separate broker, we need a transactional bridge, or we risk lost or doubled sends. |
 | 17 ★ | Can we add an external-ID field `Portal_Id__c` in Salesforce? | Yes. Creates are upserts on it, so a retry never creates a duplicate. | Creates are not idempotent. We must look up by email before retrying, and duplicates are still possible. |
@@ -106,7 +107,7 @@ The questions marked ★ change a core rule. Ask these first.
 -- Enum types. Adding a value later: ALTER TYPE … ADD VALUE (cannot remove one).
 CREATE TYPE object_type     AS ENUM ('Customer', 'Contact');
 CREATE TYPE change_source   AS ENUM ('portal', 'salesforce', 'sf_automation', 'catchup');
-CREATE TYPE history_status  AS ENUM ('applied', 'superseded', 'echo', 'rejected', 'rejected_superseded');
+CREATE TYPE history_status  AS ENUM ('applied', 'superseded', 'echo', 'rejected', 'rejected_superseded', 'gap');
 CREATE TYPE send_status     AS ENUM ('in_flight', 'done', 'rejected', 'failed');
 CREATE TYPE sf_status       AS ENUM ('up', 'down');
 
@@ -391,7 +392,22 @@ This catches bugs, such as a mismatch between our normaliser and Salesforce's, b
 - Webhooks: Salesforce cannot deliver them. Anything lost there is recovered by catch-up.
 
 **Drain on recovery, in this order:**
-1. **Catch-up query first.** Run `SystemModstamp > outage_start − 5 min` (overlap margin), paged at 2,000 rows. Each row goes through the inbound path (§5) with a synthetic `event_id`. This puts Salesforce's newer values in place **before** we push portal edits, so §7 decides each conflict correctly.
+1. **Catch-up first, in three steps** (#27). The window starts at `outage_start − 5 min`, an overlap margin.
+   1. **Field history.** Query `ContactHistory` and `AccountHistory` with `CreatedDate > window`, `ORDER BY CreatedDate, Id`, paged at 2,000 rows. **Each history row is one field change, with its user and time.** Turn each row into a single-field event and run it through the inbound path (§5):
+      - `event_id = 'h:' || history Id`. This is stable, so a re-run of catch-up dedupes on it.
+      - `changedFields = { field: NewValue }`. The Salesforce field name is mapped to ours (for example `MailingCity` → `city`).
+      - `occurredAt = CreatedDate`, `changedBy` = the `CreatedById` user.
+      - The echo check (§9) applies as normal, so our own writes found in history are recorded as `echo`.
+
+      Three changes to phone become three history rows in order. Two end as `superseded` and the last as `applied`. Nothing is lost.
+   2. **Users.** Collect the distinct `CreatedById` values and resolve them to emails with one `SELECT Id, Email FROM User WHERE Id IN (…)` query. Expect a few hundred users at most, so 1 call.
+   3. **Verify with the full record.** Query `SystemModstamp > window`. This step does not create history. For each field, compare Salesforce's value with our `sf_value`:
+      - Equal: nothing to do.
+      - Different: history missed something, such as a field that isn't tracked or a create. Apply the value with `source = 'catchup'` and actor `unknown (from LastModifiedById)`, and write a `gap` history row so the hole is visible. Count these rows as a metric. Normally the count is 0.
+   - **Duplicates across sources.** A change can arrive both as a webhook and as a history row, with different ids. History `CreatedDate` has only second precision. Before writing a history-row event, skip it if `field_history` already holds the same `(portal_id, field, value, actor)` with `order_ts` in the same second.
+   - **Order within one second.** Use history `Id` order. Assumed close enough, because ties within one second on one field are rare.
+
+   All of this puts Salesforce's values in place **before** we push portal edits, so §7 decides each conflict correctly.
 2. **Resume `sf-sync` work.** Each job sends only fields where `value ≠ sf_value`. A portal edit that lost to a newer Salesforce value in step 1 is therefore never sent. Everything else is sent at the bucket rate.
 3. Every call in steps 1 and 2 uses the same 80 rps bucket, and catch-up has priority.
 
@@ -401,23 +417,25 @@ This catches bugs, such as a mismatch between our normaliser and Salesforce's, b
 Outage length       6 h × 3,600 s            = 21,600 s
 
 Outbound backlog    10 edits/s × 21,600 s     = 216,000 calls
-Catch-up queries    10 SF edits/s × 21,600 s  = 216,000 rows
-                    216,000 ÷ 2,000 rows/page = 108 calls
-Total calls         216,000 + 108             = 216,108
+Catch-up: history   10 SF field changes/s × 21,600 s = 216,000 rows
+                    216,000 ÷ 2,000 rows/page        = 108 calls
+Catch-up: users     1 IN-query                       = 1 call
+Catch-up: verify    ≤ 216,000 changed records ÷ 2,000 = 108 calls
+Total calls         216,000 + 108 + 1 + 108          = 216,217
 
 Budget              80 rps (our run rate)
   minus live load   − 10 rps (new edits keep coming)
   net for backlog   = 70 rps
 
-Drain time          216,108 ÷ 70              = 3,087 s
-                    3,087 ÷ 60                ≈ 51.5 min
+Drain time          216,217 ÷ 70              = 3,088.8 s
+                    3,088.8 ÷ 60              ≈ 51.5 min
 ```
 
 Two things make this smaller in practice: one call per record carries all of its changed fields, and fields superseded by Salesforce are skipped. 51.5 min is the upper bound.
 
-*Optional, only if Salesforce confirms a composite call of 200 records counts as one request:* 216,000 ÷ 200 = 1,080 calls. (1,080 + 108) ÷ 70 ≈ 17 s.
+*Optional, only if Salesforce confirms a composite call of 200 records counts as one request:* 216,000 ÷ 200 = 1,080 calls. (1,080 + 217) ÷ 70 ≈ 19 s.
 
-**Lost webhooks while Salesforce is up:** the same catch-up query also runs every **15 min** (pg-boss `schedule` on `sf-catchup`) from `catchup_watermark`. At 10 edits/s that is 9,000 rows ÷ 2,000 = 5 calls per run, which is small. It covers webhooks Salesforce dropped outside an outage.
+**Lost webhooks while Salesforce is up:** the same catch-up query also runs every **15 min** (pg-boss `schedule` on `sf-catchup`) from `catchup_watermark`. It runs the same three steps. At 10 edits/s that is 9,000 rows ÷ 2,000 = 5 history calls, plus 1 user call and 5 verify calls, so 11 calls per run, which is small. It covers webhooks Salesforce dropped outside an outage.
 
 ---
 
@@ -502,6 +520,10 @@ Failure alerts, which catch jobs that fail for good and handlers that crash:
 | R2 | Continue R1: bring Salesforce up. | The catch-up job runs before the first update call. All 100 records are delivered. Both sides are equal. |
 | R3 | Kill the worker after a call is sent but before the 2xx is processed. | The job runs again after 60 s. The resend is harmless. State ends consistent. |
 | R4 | During the outage, sales edits the same field a portal user edited later, but the sales edit is newer (it reaches us through catch-up). | The portal value is never sent. Both sides hold the sales value. |
+| R5 | During the outage, sales changes phone 3 times. Fake Salesforce holds 3 history rows. Bring Salesforce up. | `field_history` has all 3 changes, each with the sales user and `CreatedDate`. Two are `superseded` and the last is `applied`. |
+| R6 | Run catch-up twice over the same window. | No new history rows on the second run (dedupe on `h:` id). |
+| R7 | One change was delivered as a webhook and also appears as a history row. | One history row, not two. |
+| R8 | Fake Salesforce changes a field with no history row (tracking off). | The verify step applies the value and writes a `gap` row. The gap metric is 1. |
 
 ### Concurrent edits to the same record
 

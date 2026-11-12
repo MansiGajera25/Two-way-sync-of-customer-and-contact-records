@@ -103,12 +103,19 @@ The questions marked ★ change a core rule. Ask these first.
 ## 4. Data we store
 
 ```sql
+-- Enum types. Adding a value later: ALTER TYPE … ADD VALUE (cannot remove one).
+CREATE TYPE object_type     AS ENUM ('Customer', 'Contact');
+CREATE TYPE change_source   AS ENUM ('portal', 'salesforce', 'sf_automation', 'catchup');
+CREATE TYPE history_status  AS ENUM ('applied', 'superseded', 'echo', 'rejected', 'rejected_superseded');
+CREATE TYPE send_status     AS ENUM ('in_flight', 'done', 'rejected', 'failed');
+CREATE TYPE sf_status       AS ENUM ('up', 'down');
+
 -- Identity. Portal-created records have no sf_id until Salesforce confirms the create.
 -- Every transaction that writes a record's state locks this row first (§7).
 record (
   portal_id        uuid PK,
   sf_id            text UNIQUE NULL,
-  object_type      text,            -- 'Customer' | 'Contact'
+  object_type      object_type,
   sf_customer_id   text NULL        -- set on a Contact whose customer we have not seen yet (#19)
 )
 
@@ -121,7 +128,7 @@ field_state (
   order_ts         timestamptz,    -- time of the edit that set `value`; used by the ordering rule (§7)
   order_tiebreak   text,           -- see §7
   actor            text,
-  source           text,           -- 'portal' | 'salesforce' | 'sf_automation' | 'catchup'
+  source           change_source,
   sf_value         text,           -- the value Salesforce holds, as far as we know
   sf_value_ts      timestamptz,    -- time of the Salesforce event (or our 2xx) that set sf_value
   diverged         boolean DEFAULT false,   -- set when the push guard trips (§9)
@@ -131,9 +138,10 @@ field_state (
 
 -- Every change ever seen, including ones that lost. Never updated except `status`. Partitioned by month.
 field_history (
-  id, portal_id, field, value, actor, source,
+  id, portal_id, field, value, actor,
+  source   change_source,
   order_ts, received_at, event_id NULL,
-  status   text,   -- 'applied' | 'superseded' | 'echo' | 'rejected' | 'rejected_superseded'
+  status   history_status,
   error    text NULL
 )
 
@@ -153,12 +161,18 @@ sf_send_log (
   value          text,
   field_version  bigint,     -- the field_state.version that was sent
   sent_at        timestamptz,
-  status         text,       -- 'in_flight' | 'done' | 'rejected' | 'failed'
+  status         send_status,
   sf_response    jsonb NULL
 )
 INDEX sf_send_log (portal_id, field, sent_at)
 
-sync_state (key PK, value)   -- 'sf_status' up|down, 'outage_start', 'catchup_watermark'
+-- Single-row table: typed columns instead of key/value text.
+sync_state (
+  id                 boolean PK DEFAULT true CHECK (id),
+  sf_status          sf_status DEFAULT 'up',
+  outage_start       timestamptz NULL,
+  catchup_watermark  timestamptz
+)
 owner_map (sf_user_id PK, portal_user_id NULL)
 user_notice (id, portal_user_id, portal_id, field, message, created_at, read_at)
 
